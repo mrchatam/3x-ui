@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 
@@ -156,26 +157,68 @@ func (s *InboundService) MergeInboundClientIps(incomingIps []model.InboundClient
 			continue
 		}
 
-		var oldEntries []clientIpEntry
-		if current.Ips != "" {
-			_ = json.Unmarshal([]byte(current.Ips), &oldEntries)
-		}
-
-		merged := mergeClientIpEntries(oldEntries, incomingEntries, cutoff)
-		b, _ := json.Marshal(merged)
-		mergedStr := string(b)
-
-		// A concurrent check_client_ip_job db.Save on the same row can interleave
-		// with this update (benign last-writer-wins; any dropped IP reappears on the
-		// next scan/sync), so only write when the blob actually changed.
-		if current.Ips != mergedStr {
-			if err := tx.Model(&model.InboundClientIps{}).Where("id = ?", current.Id).Update("ips", mergedStr).Error; err != nil {
-				tx.Rollback()
-				return err
-			}
+		// check_client_ip_job also RMW-writes this blob. An unconditional Update
+		// loses whichever writer commits second (#6587): a remote IP that only
+		// lives in the blob then drops out of partitionLiveIps' 120s window.
+		// Compare-and-set on the previous blob, re-read + re-merge on miss.
+		if err := mergeExistingClientIps(tx, current.Id, incomingEntries, cutoff); err != nil {
+			tx.Rollback()
+			return err
 		}
 	}
 	return tx.Commit().Error
+}
+
+// ClientIpCasRetries bounds how many times a merge will re-read after a
+// concurrent writer wins the compare-and-set. Collisions are brief (one scan
+// vs one node sync); exhausting this is treated as a hard error so the caller
+// retries on its next schedule rather than silently dropping the report.
+const ClientIpCasRetries = 8
+
+// CasUpdateInboundClientIps writes newIps only when the row's ips column still
+// equals expectedIps — the blob this writer based its merge on. updated=false
+// with a nil error means a concurrent writer committed first; the caller must
+// re-read and retry. Matches the conditional Where+RowsAffected pattern used
+// elsewhere (e.g. NodeService api_token / config_dirty_at CAS). Shared by
+// MergeInboundClientIps and check_client_ip_job so neither can lose the other's
+// IPs under PostgreSQL (#6587).
+func CasUpdateInboundClientIps(tx *gorm.DB, id int, expectedIps, newIps string) (updated bool, err error) {
+	res := tx.Model(&model.InboundClientIps{}).
+		Where("id = ? AND ips = ?", id, expectedIps).
+		Update("ips", newIps)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// mergeExistingClientIps folds incoming into the row at id under a CAS loop so
+// a concurrent check_client_ip_job write cannot erase the merge (#6587).
+func mergeExistingClientIps(tx *gorm.DB, id int, incoming []clientIpEntry, cutoff int64) error {
+	for attempt := 0; attempt < ClientIpCasRetries; attempt++ {
+		var row model.InboundClientIps
+		if err := tx.Where("id = ?", id).First(&row).Error; err != nil {
+			return err
+		}
+		var oldEntries []clientIpEntry
+		if row.Ips != "" {
+			_ = json.Unmarshal([]byte(row.Ips), &oldEntries)
+		}
+		merged := mergeClientIpEntries(oldEntries, incoming, cutoff)
+		b, _ := json.Marshal(merged)
+		mergedStr := string(b)
+		if row.Ips == mergedStr {
+			return nil
+		}
+		ok, err := CasUpdateInboundClientIps(tx, id, row.Ips, mergedStr)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("inbound_client_ips id=%d: exhausted CAS retries merging client IPs", id)
 }
 
 func (s *InboundService) UpdateClientIPs(tx *gorm.DB, oldEmail string, newEmail string) error {

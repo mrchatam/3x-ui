@@ -498,6 +498,12 @@ func (j *CheckClientIpJob) delInboundClientIps(tx *gorm.DB, clientEmail string) 
 // and applies the IP limit. limitIp comes from the caller (the clients table);
 // writes go through the caller's transaction. banned=true asks the caller to
 // disconnect the client after the transaction commits.
+//
+// The ips blob is also RMW-written by MergeInboundClientIps on node sync. A
+// blind Save loses whichever writer commits second (#6587), so the enforce
+// path compare-and-sets the previous blob and re-merges on miss. Ban side
+// effects run only after the blob write succeeds (or is a no-op), so a lost
+// CAS cannot advance bannedSeen for a state that never landed.
 func (j *CheckClientIpJob) updateInboundClientIps(tx *gorm.DB, inboundClientIps *model.InboundClientIps, inbound *model.Inbound, clientEmail string, limitIp int, newIpsWithTime []IPWithTimestamp, enforce, observedAreLive bool) (shouldCleanLog, banned bool) {
 	if inbound.Settings == "" {
 		logger.Debug("wrong data:", inbound)
@@ -515,72 +521,89 @@ func (j *CheckClientIpJob) updateInboundClientIps(tx *gorm.DB, inboundClientIps 
 		return false, false
 	}
 
-	// Parse old IPs from database
-	var oldIpsWithTime []IPWithTimestamp
-	if inboundClientIps.Ips != "" {
-		_ = json.Unmarshal([]byte(inboundClientIps.Ips), &oldIpsWithTime)
-	}
-
-	ipMap := mergeClientIps(oldIpsWithTime, newIpsWithTime, time.Now().Unix()-ipStaleAfterSeconds, observedAreLive)
-
-	// only ips seen in this scan count toward the limit. see
-	// partitionLiveIps.
 	observedThisScan := make(map[string]bool, len(newIpsWithTime))
 	for _, ipTime := range newIpsWithTime {
 		observedThisScan[ipTime.IP] = true
 	}
-	liveIps, historicalIps := partitionLiveIps(ipMap, observedThisScan)
+	staleCutoff := time.Now().Unix() - ipStaleAfterSeconds
 
-	j.disAllowedIps = []string{}
-
-	// historical db-only ips are excluded from this count on purpose.
-	limitedIps, allowedIps := j.allowlist.split(liveIps)
-	keptLive, bannedLive := selectIpsToBan(limitedIps, limitIp)
-	// Allowlisted addresses stay connected and out of the count: charging them
-	// against the limit would still cut the shared network the entry protects.
-	keptLive = append(keptLive, allowedIps...)
-	actionable := j.filterAdvancedSinceLastBan(clientEmail, bannedLive)
-	if len(actionable) > 0 {
-		shouldCleanLog = true
-		banned = true
-
-		logIpFile, err := os.OpenFile(xray.GetIPLimitLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			logger.Errorf("failed to open IP limit log file: %s", err)
-			return false, false
+	for attempt := 0; attempt < service.ClientIpCasRetries; attempt++ {
+		var oldIpsWithTime []IPWithTimestamp
+		if inboundClientIps.Ips != "" {
+			_ = json.Unmarshal([]byte(inboundClientIps.Ips), &oldIpsWithTime)
 		}
-		defer logIpFile.Close()
-		ipLogger := log.New(logIpFile, "", log.LstdFlags)
 
-		// log format is load-bearing: x-ui.sh create_iplimit_jails builds
-		// filter.d/3x-ipl.conf with
-		//   failregex = \[LIMIT_IP\]\s*Email\s*=\s*<F-USER>.+</F-USER>\s*\|\|\s*Disconnecting OLD IP\s*=\s*<ADDR>\s*\|\|\s*Timestamp\s*=\s*\d+
-		// don't change the wording.
-		for _, ipTime := range actionable {
-			j.disAllowedIps = append(j.disAllowedIps, ipTime.IP)
-			ipLogger.Printf("[LIMIT_IP] Email = %s || Disconnecting OLD IP = %s || Timestamp = %d", clientEmail, ipTime.IP, ipTime.Timestamp)
+		ipMap := mergeClientIps(oldIpsWithTime, newIpsWithTime, staleCutoff, observedAreLive)
+
+		// only ips seen in this scan count toward the limit. see
+		// partitionLiveIps.
+		liveIps, historicalIps := partitionLiveIps(ipMap, observedThisScan)
+
+		// historical db-only ips are excluded from this count on purpose.
+		limitedIps, allowedIps := j.allowlist.split(liveIps)
+		keptLive, bannedLive := selectIpsToBan(limitedIps, limitIp)
+		// Allowlisted addresses stay connected and out of the count: charging them
+		// against the limit would still cut the shared network the entry protects.
+		keptLive = append(keptLive, allowedIps...)
+
+		// keep kept-live + historical in the blob so the panel keeps showing
+		// recently seen ips. banned live ips are already in the fail2ban log
+		// and will reappear in the next scan if they reconnect.
+		dbIps := make([]IPWithTimestamp, 0, len(keptLive)+len(historicalIps))
+		dbIps = append(dbIps, keptLive...)
+		dbIps = append(dbIps, historicalIps...)
+		jsonIps, _ := json.Marshal(dbIps)
+		newStr := string(jsonIps)
+
+		if inboundClientIps.Ips != newStr {
+			ok, err := service.CasUpdateInboundClientIps(tx, inboundClientIps.Id, inboundClientIps.Ips, newStr)
+			if err != nil {
+				logger.Error("failed to save inboundClientIps:", err)
+				return false, false
+			}
+			if !ok {
+				if err := tx.Where("id = ?", inboundClientIps.Id).First(inboundClientIps).Error; err != nil {
+					logger.Error("failed to re-read inboundClientIps after CAS miss:", err)
+					return false, false
+				}
+				continue
+			}
+			inboundClientIps.Ips = newStr
 		}
+
+		j.disAllowedIps = []string{}
+		actionable := j.filterAdvancedSinceLastBan(clientEmail, bannedLive)
+		if len(actionable) > 0 {
+			shouldCleanLog = true
+			banned = true
+
+			logIpFile, err := os.OpenFile(xray.GetIPLimitLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				logger.Errorf("failed to open IP limit log file: %s", err)
+				return false, false
+			}
+			defer logIpFile.Close()
+			ipLogger := log.New(logIpFile, "", log.LstdFlags)
+
+			// log format is load-bearing: x-ui.sh create_iplimit_jails builds
+			// filter.d/3x-ipl.conf with
+			//   failregex = \[LIMIT_IP\]\s*Email\s*=\s*<F-USER>.+</F-USER>\s*\|\|\s*Disconnecting OLD IP\s*=\s*<ADDR>\s*\|\|\s*Timestamp\s*=\s*\d+
+			// don't change the wording.
+			for _, ipTime := range actionable {
+				j.disAllowedIps = append(j.disAllowedIps, ipTime.IP)
+				ipLogger.Printf("[LIMIT_IP] Email = %s || Disconnecting OLD IP = %s || Timestamp = %d", clientEmail, ipTime.IP, ipTime.Timestamp)
+			}
+		}
+
+		if len(j.disAllowedIps) > 0 {
+			logger.Infof("[LIMIT_IP] Client %s: Kept %d live IPs, queued %d old IPs for fail2ban", clientEmail, len(keptLive), len(j.disAllowedIps))
+		}
+
+		return shouldCleanLog, banned
 	}
 
-	// keep kept-live + historical in the blob so the panel keeps showing
-	// recently seen ips. banned live ips are already in the fail2ban log
-	// and will reappear in the next scan if they reconnect.
-	dbIps := make([]IPWithTimestamp, 0, len(keptLive)+len(historicalIps))
-	dbIps = append(dbIps, keptLive...)
-	dbIps = append(dbIps, historicalIps...)
-	jsonIps, _ := json.Marshal(dbIps)
-	inboundClientIps.Ips = string(jsonIps)
-
-	if err := tx.Save(inboundClientIps).Error; err != nil {
-		logger.Error("failed to save inboundClientIps:", err)
-		return false, banned
-	}
-
-	if len(j.disAllowedIps) > 0 {
-		logger.Infof("[LIMIT_IP] Client %s: Kept %d live IPs, queued %d old IPs for fail2ban", clientEmail, len(keptLive), len(j.disAllowedIps))
-	}
-
-	return shouldCleanLog, banned
+	logger.Error("failed to save inboundClientIps: exhausted CAS retries")
+	return false, false
 }
 
 // filterAdvancedSinceLastBan keeps only banned pairs whose lastSeen advanced since
