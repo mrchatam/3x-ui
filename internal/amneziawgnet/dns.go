@@ -135,21 +135,46 @@ func flushTunnelDNSCacheForTag(tag string) {
 	}
 }
 
-// exchangeTunnelDNSWithFallback queries A and/or AAAA depending on the local
-// address families configured on the device stack.
-func exchangeTunnelDNSWithFallback(ctx context.Context, conn *gonet.UDPConn, addrs []netip.Addr, host string) (netip.Addr, error) {
+// dnsQueryTypesFor returns the DNS record types the tunnel can actually dial.
+// IPv4-only devices never query AAAA (and vice versa), so a failed A lookup
+// cannot poison the cache with an unroutable IPv6 answer. Dual-stack prefers
+// A then AAAA; unknown capability (empty addrs) keeps the historical A→AAAA
+// order so callers without a configured Address still resolve something.
+func dnsQueryTypesFor(addrs []netip.Addr) []dnsmessage.Type {
 	hasV4 := deviceHasV4(addrs)
 	hasV6 := deviceHasV6(addrs)
-
-	// If the tunnel is IPv6-only, query AAAA first; else query A first.
-	types := []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA}
-	if hasV6 && !hasV4 {
-		types = []dnsmessage.Type{dnsmessage.TypeAAAA, dnsmessage.TypeA}
+	switch {
+	case hasV4 && hasV6:
+		return []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA}
+	case hasV6:
+		return []dnsmessage.Type{dnsmessage.TypeAAAA}
+	case hasV4:
+		return []dnsmessage.Type{dnsmessage.TypeA}
+	default:
+		return []dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA}
 	}
+}
+
+// tunnelSupportsAddr reports whether the device stack has a local address in
+// the same family as ip (IPv4-mapped IPv6 counts as IPv4).
+func tunnelSupportsAddr(addrs []netip.Addr, ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.Is4() || ip.Is4In6() {
+		return deviceHasV4(addrs)
+	}
+	return deviceHasV6(addrs)
+}
+
+// exchangeTunnelDNSWithFallback queries only the address families the local
+// device stack can route, so AAAA answers are never returned (or cached) on a
+// v4-only tunnel.
+func exchangeTunnelDNSWithFallback(ctx context.Context, conn *gonet.UDPConn, addrs []netip.Addr, host string) (netip.Addr, error) {
+	types := dnsQueryTypesFor(addrs)
 
 	var firstErr error
 	for _, qType := range types {
-		// Skip AAAA if device has no IPv6 capability and has IPv4, unless A failed.
 		addr, err := exchangeTunnelDNSQuery(ctx, conn, host, qType)
 		if err == nil {
 			return addr, nil
