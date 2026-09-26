@@ -135,11 +135,8 @@ func flushTunnelDNSCacheForTag(tag string) {
 	}
 }
 
-// dnsQueryTypesFor returns the DNS record types the tunnel can actually dial.
-// IPv4-only devices never query AAAA (and vice versa), so a failed A lookup
-// cannot poison the cache with an unroutable IPv6 answer. Dual-stack prefers
-// A then AAAA; unknown capability (empty addrs) keeps the historical A→AAAA
-// order so callers without a configured Address still resolve something.
+// dnsQueryTypesFor asks only for families the tunnel can dial, so a v4-only tunnel
+// never caches an unroutable AAAA answer (#6570). No addresses keeps A then AAAA.
 func dnsQueryTypesFor(addrs []netip.Addr) []dnsmessage.Type {
 	hasV4 := deviceHasV4(addrs)
 	hasV6 := deviceHasV6(addrs)
@@ -167,9 +164,8 @@ func tunnelSupportsAddr(addrs []netip.Addr, ip netip.Addr) bool {
 	return deviceHasV6(addrs)
 }
 
-// exchangeTunnelDNSWithFallback queries only the address families the local
-// device stack can route, so AAAA answers are never returned (or cached) on a
-// v4-only tunnel.
+// exchangeTunnelDNSWithFallback returns the first answer among the families the
+// device stack can route.
 func exchangeTunnelDNSWithFallback(ctx context.Context, conn *gonet.UDPConn, addrs []netip.Addr, host string) (netip.Addr, error) {
 	types := dnsQueryTypesFor(addrs)
 
