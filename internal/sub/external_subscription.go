@@ -9,8 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
@@ -152,7 +150,7 @@ func doFetchSubscriptionLinks(rawURL string) ([]string, error) {
 	// Some providers gate the link body on a known client User-Agent.
 	req.Header.Set("User-Agent", externalSubUserAgent())
 	// A 3x-ui donor with an HWID limit answers 404 when the header is empty (#6559).
-	if hwid := serverHwid(); hwid != "" {
+	if hwid := service.ExternalSubscriptionHwid(); hwid != "" {
 		req.Header.Set("X-HWID", hwid)
 	}
 	resp, err := subscriptionHTTPClient.Do(req)
@@ -186,41 +184,6 @@ func externalSubUserAgent() string {
 		return service.DefaultExternalSubUserAgent
 	}
 	return ua
-}
-
-// serverHwidKey is the settings row holding this panel's stable identity
-// for outbound external-subscription fetches.
-const serverHwidKey = "externalSubHwid"
-
-// serverHwidMu serializes first-time creation: without it, concurrent first
-// fetches of different URLs each mint and persist their own UUID.
-var serverHwidMu sync.Mutex
-
-// serverHwid returns a stable per-installation id, creating and persisting
-// it on first use. Empty means the DB is unreachable: send no header then.
-func serverHwid() string {
-	serverHwidMu.Lock()
-	defer serverHwidMu.Unlock()
-	db := database.GetDB()
-	if db == nil {
-		return ""
-	}
-	var row model.Setting
-	if err := db.Where("key = ?", serverHwidKey).First(&row).Error; err == nil {
-		if strings.TrimSpace(row.Value) != "" {
-			return strings.TrimSpace(row.Value)
-		}
-	}
-	hwid := "3x-ui-server-" + uuid.NewString()
-	row = model.Setting{Key: serverHwidKey, Value: hwid}
-	if err := db.Where(model.Setting{Key: serverHwidKey}).FirstOrCreate(&row).Error; err != nil {
-		logger.Warningf("sub: persisting server hwid failed: %v", err)
-		return ""
-	}
-	if strings.TrimSpace(row.Value) == "" {
-		return hwid
-	}
-	return strings.TrimSpace(row.Value)
 }
 
 type subError struct{ msg string }
