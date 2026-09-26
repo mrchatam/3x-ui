@@ -177,8 +177,11 @@ var (
 )
 
 // externalSubUserAgent returns the panel setting for external subscription
-// fetches, falling back to the historical hardcoded client UA.
+// fetches, or the historical client UA when it is unset or the DB is unreachable.
 func externalSubUserAgent() string {
+	if database.GetDB() == nil {
+		return service.DefaultExternalSubUserAgent
+	}
 	ua, err := (&service.SettingService{}).GetExternalSubUserAgent()
 	if err != nil {
 		return service.DefaultExternalSubUserAgent
