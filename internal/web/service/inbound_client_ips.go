@@ -157,10 +157,8 @@ func (s *InboundService) MergeInboundClientIps(incomingIps []model.InboundClient
 			continue
 		}
 
-		// check_client_ip_job also RMW-writes this blob. An unconditional Update
-		// loses whichever writer commits second (#6587): a remote IP that only
-		// lives in the blob then drops out of partitionLiveIps' 120s window.
-		// Compare-and-set on the previous blob, re-read + re-merge on miss.
+		// check_client_ip_job rewrites this blob too; an unconditional Update loses
+		// whichever writer commits second and its remote IPs with it (#6587).
 		if err := mergeExistingClientIps(tx, current.Id, incomingEntries, cutoff); err != nil {
 			tx.Rollback()
 			return err
@@ -169,19 +167,12 @@ func (s *InboundService) MergeInboundClientIps(incomingIps []model.InboundClient
 	return tx.Commit().Error
 }
 
-// ClientIpCasRetries bounds how many times a merge will re-read after a
-// concurrent writer wins the compare-and-set. Collisions are brief (one scan
-// vs one node sync); exhausting this is treated as a hard error so the caller
-// retries on its next schedule rather than silently dropping the report.
+// ClientIpCasRetries bounds the re-reads after losing a compare-and-set. Running
+// out is an error, so the caller retries on its next schedule instead of dropping IPs.
 const ClientIpCasRetries = 8
 
-// CasUpdateInboundClientIps writes newIps only when the row's ips column still
-// equals expectedIps — the blob this writer based its merge on. updated=false
-// with a nil error means a concurrent writer committed first; the caller must
-// re-read and retry. Matches the conditional Where+RowsAffected pattern used
-// elsewhere (e.g. NodeService api_token / config_dirty_at CAS). Shared by
-// MergeInboundClientIps and check_client_ip_job so neither can lose the other's
-// IPs under PostgreSQL (#6587).
+// CasUpdateInboundClientIps writes newIps only while the row still holds expectedIps;
+// updated=false with a nil error means another writer won and the caller must re-read.
 func CasUpdateInboundClientIps(tx *gorm.DB, id int, expectedIps, newIps string) (updated bool, err error) {
 	res := tx.Model(&model.InboundClientIps{}).
 		Where("id = ? AND ips = ?", id, expectedIps).

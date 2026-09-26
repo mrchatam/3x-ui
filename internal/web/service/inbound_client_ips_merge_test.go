@@ -251,11 +251,8 @@ func TestCasUpdateInboundClientIps_MatchAndMismatch(t *testing.T) {
 	}
 }
 
-// TestMergeInboundClientIps_RetriesAfterConcurrentWriter guards #6587: a
-// check_client_ip_job write that lands between MergeInboundClientIps' read and
-// its Update must not drop the node's report. We inject the job's write via a
-// Before(update) hook so SQLite (which serializes writers) can still exercise
-// the CAS miss + re-merge path.
+// A job write landing between the merge's read and its Update must not drop the
+// node's report (#6587); a Before(update) hook injects it, since SQLite serializes writers.
 func TestMergeInboundClientIps_RetriesAfterConcurrentWriter(t *testing.T) {
 	setupClientIpTestDB(t)
 	db := database.GetDB()
