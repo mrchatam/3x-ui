@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// The JSON-subscription embed must not ship the deprecated freedom settings
-// key — xray-core migrates it to sockopt with a warning on every load (#6482 /
-// #6515). AsIs is the core default when absent.
+// xray-core moves freedom settings.domainStrategy to sockopt with a warning on
+// every load (#6482); the embed omits it and gets the AsIs default.
 func TestDefaultJSON_FreedomOutboundHasNoLegacyDomainStrategy(t *testing.T) {
 	var cfg map[string]any
 	if err := json.Unmarshal([]byte(defaultJson), &cfg); err != nil {
