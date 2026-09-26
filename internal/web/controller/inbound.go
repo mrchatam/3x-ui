@@ -442,12 +442,8 @@ func (a *InboundController) importInbound(c *gin.Context) {
 	notifyClientsChanged()
 }
 
-// resolveHost mirrors sub.SubService.ResolveRequest for the host field:
-// trusted X-Forwarded-Host (first entry, port stripped), else the dialed
-// request Host. X-Real-IP is never used — it names the visitor, not the panel
-// (same leak as #6589 when nginx on loopback sets only X-Real-IP). Keeping it
-// in the controller layer means the service interface stays HTTP-agnostic —
-// service methods receive a plain host string instead of a *gin.Context.
+// resolveHost mirrors SubService.ResolveRequest's host: trusted X-Forwarded-Host,
+// else the dialed request Host. X-Real-IP names the visitor, not the panel (#6589).
 func resolveHost(c *gin.Context) string {
 	if isTrustedForwardedRequest(c) {
 		if h := strings.TrimSpace(c.GetHeader("X-Forwarded-Host")); h != "" {

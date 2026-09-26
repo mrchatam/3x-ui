@@ -154,10 +154,8 @@ func TestResolveRequest_GatesRealIPFallback(t *testing.T) {
 	}
 }
 
-// Trusted proxies still must not treat X-Real-IP as a hostname. Default
-// trustedProxyCIDRs trusts every origin, and nginx often sets X-Real-IP without
-// X-Forwarded-Host — that combination used to put the subscriber's public IP
-// into subscription "server" fields (#6589).
+// nginx often sets X-Real-IP without X-Forwarded-Host; a trusted proxy's X-Real-IP
+// used to put the subscriber's public IP into subscription "server" fields (#6589).
 func TestResolveRequest_IgnoresRealIPEvenWhenTrusted(t *testing.T) {
 	initSubDB(t)
 	// Empty / shipped-default CIDRs → forwardedHeadersTrusted returns true.
